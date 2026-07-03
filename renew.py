@@ -358,28 +358,22 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
 
     card = page.locator("div.client-card", has_text=name).first
 
-    # 监听前端自动发出的续期 API 响应（只监听 /upgrade/renew，忽略 GET 查询）
-    renew_result_holder = {"status": None, "body": None, "url": None}
+    # 监听 captcha 验证接口，拿到 token 后自己调续期 API
+    # captcha 接口返回: {"passed": true, "token": "eyJ..."}
+    captcha_token_holder = {"token": None}
 
     def _on_response(res):
         try:
-            # 只关心 /upgrade/renew 接口
-            if "/upgrade/renew" not in res.url:
+            if "/auth/captcha" not in res.url:
                 return
             ctype = res.headers.get("content-type") or ""
             if "application/json" not in ctype:
                 return
-            body_text = res.text()
-            log(f"[{tag}] [{name}] 捕获到续期响应 HTTP {res.status} from {res.url}: {body_text[:300]}")
-            # 忽略点击 Renew 按钮时触发的第一个 403（captcha_required，验证前正常触发）
-            if res.status == 403:
-                log(f"[{tag}] [{name}] 忽略 403 captcha_required（验证前触发，正常）")
-                return
-            # 第一个非 403 的续期响应才是验证通过后的真正结果
-            if renew_result_holder["status"] is None:
-                renew_result_holder["status"] = res.status
-                renew_result_holder["body"]   = body_text
-                renew_result_holder["url"]    = res.url
+            body = res.json()
+            if isinstance(body, dict) and body.get("passed") and body.get("token"):
+                if not captcha_token_holder["token"]:
+                    captcha_token_holder["token"] = body["token"]
+                    log(f"[{tag}] [{name}] captcha token 已捕获（来源: {res.url}）")
         except Exception as e:
             log_warn(f"[{tag}] [{name}] 响应监听出错: {e}")
 
@@ -414,80 +408,60 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
 
         screenshot(page, f"acct{idx}_renew_{identifier}_b_after_captcha")
 
-        # ── 5. 等待前端完成续期（弹窗消失 或 捕获到续期响应），最多等 40s ──
-        log(f"[{tag}] [{name}] 等待弹窗消失或续期响应（最多40s）...")
-        dialog_gone = False
-        for _ in range(40):
-            # 优先判断：已拿到续期响应
-            if renew_result_holder["status"] is not None:
-                log(f"[{tag}] [{name}] 已捕获到续期响应，停止等待")
-                break
-            # 次判断：弹窗消失（前端处理完毕）
-            try:
-                if not dialog.is_visible():
-                    dialog_gone = True
-                    log(f"[{tag}] [{name}] 弹窗已消失，续期完成信号")
-                    break
-            except Exception:
-                dialog_gone = True
+        # ── 5. 等待 captcha token（最多 30s）────────────────
+        log(f"[{tag}] [{name}] 等待 captcha token（最多30s）...")
+        for _ in range(30):
+            if captcha_token_holder["token"]:
                 break
             time.sleep(1)
 
+        if not captcha_token_holder["token"]:
+            raise RuntimeError("30s 内未捕获到 captcha token，图块验证未通过或超时")
+
+        token = captcha_token_holder["token"]
+
+        # ── 6. 携带 token 调用续期 API ───────────────────────
+        renew_url = f"/api/client/servers/{identifier}/upgrade/renew"
+        log(f"[{tag}] [{name}] 调用续期接口 {renew_url}")
+        result = page.evaluate("""async ({url, token}) => {
+            const xsrf = decodeURIComponent(
+                (document.cookie.match(/XSRF-TOKEN=([^;]+)/) || [])[1] || ''
+            );
+            const r = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'X-XSRF-TOKEN': xsrf
+                },
+                body: JSON.stringify({captcha_token: token})
+            });
+            return {status: r.status, body: await r.text()};
+        }""", {"url": renew_url, "token": token})
+
         screenshot(page, f"acct{idx}_renew_{identifier}_c_result")
 
-        # ── 6. 判断结果 ──────────────────────────────────────
-        if renew_result_holder["status"] is not None:
-            # 从拦截到的响应判断
-            status = renew_result_holder["status"]
-            body_text = renew_result_holder["body"] or ""
-            log(f"[{tag}] [{name}] 续期响应 HTTP {status}: {body_text[:300]}")
-            if status == 429:
-                raise RuntimeError(f"续期被限流（429 Too Many Attempts），请等待冷却后重试: {body_text[:200]}")
-            if status != 200:
-                raise RuntimeError(f"续期请求失败 HTTP {status}: {body_text[:200]}")
-            try:
-                data = json.loads(body_text)
-            except Exception:
-                raise RuntimeError(f"续期响应无法解析为 JSON: {body_text[:200]}")
-            # 成功判断：有 success=true，或者响应里包含 expires_at（部分面板直接返回服务器对象）
-            if data.get("success"):
-                log(f"[{tag}] [{name}] 续期成功 ✅ {data.get('message', '')}")
-                if data.get("expires_at"):
-                    return parse_expires(data["expires_at"])
-                return None
-            # 有些面板续期成功后直接返回 server 对象（含 attributes.expires_at）
-            attrs = data.get("attributes", {})
-            if attrs.get("expires_at"):
-                log(f"[{tag}] [{name}] 续期成功 ✅（server 对象响应）")
-                return parse_expires(attrs["expires_at"])
-            raise RuntimeError(f"续期返回失败: {data.get('message', '未知错误')} | body: {body_text[:200]}")
+        status = result["status"]
+        body_text = result["body"] or ""
+        log(f"[{tag}] [{name}] 续期响应 HTTP {status}: {body_text[:300]}")
 
-        elif dialog_gone:
-            # 弹窗消失但没有拦截到响应 → 等一下再刷页面查真实剩余天数
-            log(f"[{tag}] [{name}] 弹窗已消失，未拦截到续期响应，刷新页面查验结果...")
-            time.sleep(2)
-            page.reload(timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=20000)
-            time.sleep(2)
-            # 重新查项目过期时间
-            result = page.evaluate("""async () => {
-                const r = await fetch('/api/client', {headers: {'Accept': 'application/json'}});
-                return {status: r.status, body: await r.text()};
-            }""")
-            if result["status"] == 200:
-                data = json.loads(result["body"])
-                for item in data.get("data", []):
-                    attrs = item.get("attributes", {})
-                    if attrs.get("identifier") == identifier:
-                        new_remaining = parse_expires(attrs.get("expires_at"))
-                        log(f"[{tag}] [{name}] 刷新后剩余: {new_remaining:.2f} 天")
-                        return new_remaining
-            # 查不到就当成功（弹窗消失通常意味着成功）
-            log(f"[{tag}] [{name}] 无法查询新过期时间，弹窗消失视为成功 ✅")
-            return None
+        if status == 429:
+            raise RuntimeError(f"续期被限流（429 Too Many Attempts）: {body_text[:200]}")
+        if status != 200:
+            raise RuntimeError(f"续期请求失败 HTTP {status}: {body_text[:200]}")
 
-        else:
-            raise RuntimeError("40s 内弹窗未消失，续期可能失败（captcha 未通过或超时）")
+        try:
+            data = json.loads(body_text)
+        except Exception:
+            raise RuntimeError(f"续期响应无法解析为 JSON: {body_text[:200]}")
+
+        if not data.get("success"):
+            raise RuntimeError(f"续期返回失败: {data.get('message', '未知错误')}")
+
+        log(f"[{tag}] [{name}] 续期成功 ✅ {data.get('message', '')}")
+        if data.get("expires_at"):
+            return parse_expires(data["expires_at"])
+        return None
 
     finally:
         try:

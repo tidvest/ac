@@ -344,44 +344,41 @@ def solve_image_challenge(page, dialog, tag: str, name: str, idx: int, identifie
     return clicked
 
 
-# ── 单个项目续期（真实 UI 点击 + 人机验证 + captcha_token 直调 API）──
+# ── 单个项目续期（真实 UI 点击 + 人机验证，让前端完成续期）──
 def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
     """
     在 /projects 页面：
       1. 找到该项目卡片里的 Renew 按钮并点击 → 弹出 Anti-bot confirmation 弹窗
       2. 点击 div.auth-captcha-inner 触发验证码请求
-         - 若通过：直接抓 captcha_token
-         - 若触发二级图块挑战：调用 Claude Vision API 识别并点击正确图块，再等 captcha_token
-      3. 拿到 token 后直接 POST /api/client/servers/{id}/upgrade/renew
+         - 若直接通过（一级）：前端自动提交续期请求，弹窗消失
+         - 若触发二级图块挑战：OCR 识别并点击正确图块，前端提交续期请求，弹窗消失
+      3. 监听前端发出的 /upgrade/renew 请求结果，或等弹窗消失来判断成功
     """
     from playwright.sync_api import TimeoutError as PWTimeout
 
     card = page.locator("div.client-card", has_text=name).first
 
-    # 用于从网络响应里捕获 captcha_token
-    captcha_token_holder = {"token": None, "source_url": None}
+    # 监听前端自动发出的续期 API 响应
+    renew_result_holder = {"status": None, "body": None, "url": None}
 
     def _on_response(res):
         try:
-            ctype = res.headers.get("content-type") or ""
-            if "application/json" not in ctype:
-                return
-            body = res.json()
-            if isinstance(body, dict) and body.get("captcha_token"):
-                if not captcha_token_holder["token"]:
-                    captcha_token_holder["token"] = body["captcha_token"]
-                    captcha_token_holder["source_url"] = res.url
-        except Exception:
-            pass
+            if f"/upgrade/renew" in res.url or f"servers/{identifier}" in res.url:
+                ctype = res.headers.get("content-type") or ""
+                if "application/json" in ctype:
+                    body_text = res.text()
+                    renew_result_holder["status"] = res.status
+                    renew_result_holder["body"]   = body_text
+                    renew_result_holder["url"]    = res.url
+                    log(f"[{tag}] [{name}] 捕获到服务器响应 {res.status} from {res.url}: {body_text[:200]}")
+        except Exception as e:
+            log_warn(f"[{tag}] [{name}] 响应监听出错: {e}")
 
     page.on("response", _on_response)
 
     try:
         # ── 1. 点击 Renew 按钮 ─────────────────────────────
         log(f"[{tag}] [{name}] 查找并点击 Renew 按钮...")
-        # 不依赖按钮文字（面板语言按账号不同可能是 Renew/Renouveler/续订 等），
-        # 改为按 DOM 结构定位：续期按钮唯一地位于 div.projects-card-expiry 容器内，
-        # 与 Gérer/Modifier/Supprimer 所在的 div.projects-card-actions 是分开的区块。
         renew_btn = card.locator("div.projects-card-expiry button.client-btn").first
         try:
             renew_btn.wait_for(state="visible", timeout=10000)
@@ -406,65 +403,74 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
         # ── 4. 检测并处理二级图块挑战 ────────────────────────
         solve_image_challenge(page, dialog, tag, name, idx, identifier)
 
-        # ── 5. 轮询等待 captcha_token（最多 40s，图块选择后需要服务端额外验证）──
+        screenshot(page, f"acct{idx}_renew_{identifier}_b_after_captcha")
+
+        # ── 5. 等待前端完成续期（弹窗消失 或 捕获到续期响应），最多等 40s ──
+        log(f"[{tag}] [{name}] 等待弹窗消失或续期响应（最多40s）...")
+        dialog_gone = False
         for _ in range(40):
-            if captcha_token_holder["token"]:
+            # 优先判断：已拿到续期响应
+            if renew_result_holder["status"] is not None:
+                log(f"[{tag}] [{name}] 已捕获到续期响应，停止等待")
+                break
+            # 次判断：弹窗消失（前端处理完毕）
+            try:
+                if not dialog.is_visible():
+                    dialog_gone = True
+                    log(f"[{tag}] [{name}] 弹窗已消失，续期完成信号")
+                    break
+            except Exception:
+                dialog_gone = True
                 break
             time.sleep(1)
 
-        screenshot(page, f"acct{idx}_renew_{identifier}_b_captcha")
+        screenshot(page, f"acct{idx}_renew_{identifier}_c_result")
 
-        if not captcha_token_holder["token"]:
-            raise RuntimeError("40s 内未捕获到 captcha_token，验证码验证失败")
+        # ── 6. 判断结果 ──────────────────────────────────────
+        if renew_result_holder["status"] is not None:
+            # 从拦截到的响应判断
+            status = renew_result_holder["status"]
+            body_text = renew_result_holder["body"] or ""
+            log(f"[{tag}] [{name}] 续期响应 HTTP {status}: {body_text[:200]}")
+            if status != 200:
+                raise RuntimeError(f"续期请求失败 HTTP {status}: {body_text[:200]}")
+            try:
+                data = json.loads(body_text)
+            except Exception:
+                raise RuntimeError(f"续期响应无法解析为 JSON: {body_text[:200]}")
+            if not data.get("success"):
+                raise RuntimeError(f"续期返回失败: {data.get('message', '未知错误')}")
+            log(f"[{tag}] [{name}] 续期成功 ✅ {data.get('message', '')}")
+            if data.get("expires_at"):
+                return parse_expires(data["expires_at"])
+            return None
 
-        token = captcha_token_holder["token"]
-        log(f"[{tag}] [{name}] captcha_token 已捕获（来源: {captcha_token_holder['source_url']}），"
-            f"直接调用续期接口")
+        elif dialog_gone:
+            # 弹窗消失但没有拦截到响应 → 等一下再刷页面查真实剩余天数
+            log(f"[{tag}] [{name}] 弹窗已消失，未拦截到续期响应，刷新页面查验结果...")
+            time.sleep(2)
+            page.reload(timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=20000)
+            time.sleep(2)
+            # 重新查项目过期时间
+            result = page.evaluate("""async () => {
+                const r = await fetch('/api/client', {headers: {'Accept': 'application/json'}});
+                return {status: r.status, body: await r.text()};
+            }""")
+            if result["status"] == 200:
+                data = json.loads(result["body"])
+                for item in data.get("data", []):
+                    attrs = item.get("attributes", {})
+                    if attrs.get("identifier") == identifier:
+                        new_remaining = parse_expires(attrs.get("expires_at"))
+                        log(f"[{tag}] [{name}] 刷新后剩余: {new_remaining:.2f} 天")
+                        return new_remaining
+            # 查不到就当成功（弹窗消失通常意味着成功）
+            log(f"[{tag}] [{name}] 无法查询新过期时间，弹窗消失视为成功 ✅")
+            return None
 
-        # ── 6. 携带 token 直接调用续期 API ──────────────────
-        renew_url = f"/api/client/servers/{identifier}/upgrade/renew"
-        result = page.evaluate("""async ({url, token}) => {
-            const xsrf = decodeURIComponent(
-                (document.cookie.match(/XSRF-TOKEN=([^;]+)/) || [])[1] || ''
-            );
-            const r = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'X-XSRF-TOKEN': xsrf
-                },
-                body: JSON.stringify({captcha_token: token})
-            });
-            return {status: r.status, body: await r.text()};
-        }""", {"url": renew_url, "token": token})
-
-        screenshot(page, f"acct{idx}_renew_{identifier}_c_after")
-
-        if result['status'] != 200:
-            raise RuntimeError(f"续期请求失败 HTTP {result['status']}: {result['body'][:200]}")
-
-        try:
-            data = json.loads(result['body'])
-        except Exception:
-            raise RuntimeError(f"续期响应无法解析为 JSON: {result['body'][:200]}")
-
-        if not data.get('success'):
-            raise RuntimeError(f"续期返回失败: {data.get('message', '未知错误')}")
-
-        log(f"[{tag}] [{name}] 续期成功 ✅ {data.get('message', '')}")
-
-        # ── 7. 尝试关闭弹窗（不强制要求成功）────────────────
-        try:
-            cancel_btn = dialog.locator("button:has-text('Annuler'), button:has-text('Cancel')").first
-            if cancel_btn.is_visible(timeout=1000):
-                cancel_btn.click(timeout=2000)
-        except Exception:
-            pass
-
-        if data.get('expires_at'):
-            return parse_expires(data['expires_at'])
-        return None
+        else:
+            raise RuntimeError("40s 内弹窗未消失，续期可能失败（captcha 未通过或超时）")
 
     finally:
         try:

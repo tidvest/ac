@@ -214,19 +214,145 @@ def screenshot(page, name: str):
     except Exception as e:
         log_warn(f"截图失败 {path}: {e}")
 
+# ── Tesseract OCR：识别图块验证码（免费，无需 API key）──────
+def ocr_image_bytes(img_bytes: bytes, debug_path: str = None) -> str:
+    """
+    用 Tesseract 识别图片中的文字。
+    对验证码图片做预处理（放大 + 灰度 + 二值化）提升准确率。
+    debug_path: 若传入路径，把预处理后的图片也保存下来方便调试。
+    """
+    import io
+    try:
+        from PIL import Image, ImageOps
+        import pytesseract
+    except ImportError as e:
+        log_warn(f"[OCR] 依赖未安装: {e}")
+        return ""
+
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+        # 白底合并（去掉透明通道）
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        bg.paste(img, mask=img.split()[3])
+        img = bg.convert("RGB")
+        log(f"[OCR] 原始尺寸: {img.size}")
+        # 放大 3 倍，再灰度 + 二值化，让 Tesseract 更容易识别
+        img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+        img = ImageOps.grayscale(img)
+        img = img.point(lambda x: 0 if x < 160 else 255)
+        if debug_path:
+            img.save(debug_path)
+            log(f"[OCR] 预处理图已保存: {debug_path}")
+        # psm 8 = 单个单词模式
+        raw = pytesseract.image_to_string(
+            img,
+            config="--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        )
+        text = raw.strip()
+        log(f"[OCR] Tesseract 原始输出: {repr(raw)}  → 清理后: 「{text}」")
+        return text
+    except Exception as e:
+        log_warn(f"[OCR] 识别出错: {e}")
+        return ""
+
+
+def solve_image_challenge(page, dialog, tag: str, name: str, idx: int, identifier: str) -> bool:
+    """
+    处理二级图块挑战（div.auth-captcha-challenge）：
+      1. 读取题目关键词（div.auth-captcha-prompt strong 的文字）
+      2. 通过 page.evaluate fetch 在浏览器上下文内拉取图片并转 base64
+         （带登录 cookie，不需要外部下载，不需要 API key）
+      3. 用本地 Tesseract OCR 识别每张图的文字
+      4. 点击与关键词匹配的那个按钮
+    返回 True 表示已点击，False 表示未触发挑战（正常一级验证直接过）。
+    """
+    import base64, io
+
+    challenge = dialog.locator("div.auth-captcha-challenge").first
+    try:
+        challenge.wait_for(state="visible", timeout=5000)
+    except Exception:
+        return False  # 没有二级挑战
+
+    # 读取题目关键词
+    try:
+        keyword = challenge.locator("div.auth-captcha-prompt strong").first.inner_text(timeout=3000).strip()
+    except Exception:
+        keyword = ""
+    log(f"[{tag}] [{name}] 图块挑战关键词: 「{keyword}」")
+    screenshot(page, f"acct{idx}_renew_{identifier}_challenge")
+
+    if not keyword:
+        log_warn(f"[{tag}] [{name}] 无法读取关键词，跳过图块挑战处理")
+        return False
+
+    # 收集四个按钮
+    option_btns = challenge.locator("button.auth-captcha-option").all()
+    log(f"[{tag}] [{name}] 找到 {len(option_btns)} 个图块选项")
+
+    clicked = False
+    for btn_idx, btn in enumerate(option_btns):
+        try:
+            img_el  = btn.locator("img.auth-captcha-option-img").first
+            img_src = img_el.get_attribute("src") or ""
+            if not img_src:
+                continue
+
+            # 在浏览器上下文里用带 cookie 的 fetch 拉取图片 → base64
+            b64 = page.evaluate("""async (src) => {
+                try {
+                    const r = await fetch(src, {credentials: 'include'});
+                    if (!r.ok) return null;
+                    const buf = await r.arrayBuffer();
+                    let bin = '';
+                    const bytes = new Uint8Array(buf);
+                    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                    return btoa(bin);
+                } catch(e) { return null; }
+            }""", img_src)
+
+            if not b64:
+                log_warn(f"[{tag}] [{name}] 选项{btn_idx+1} 图片拉取失败，跳过")
+                continue
+
+            img_bytes = base64.b64decode(b64)
+
+            # 保存图片到 screenshots 方便调试
+            os.makedirs("screenshots", exist_ok=True)
+            img_path = f"screenshots/acct{idx}_renew_{identifier}_opt{btn_idx+1}.png"
+            with open(img_path, "wb") as f:
+                f.write(img_bytes)
+
+            # Tesseract OCR 识别，同时保存预处理后的图片用于调试
+            debug_path = f"screenshots/acct{idx}_renew_{identifier}_opt{btn_idx+1}_processed.png"
+            recognized = ocr_image_bytes(img_bytes, debug_path=debug_path)
+            log(f"[{tag}] [{name}] 选项{btn_idx+1} OCR结果: 「{recognized}」")
+
+            if keyword.lower() in recognized.lower() or recognized.lower() in keyword.lower():
+                log(f"[{tag}] [{name}] ✅ 匹配！点击选项 {btn_idx+1}")
+                btn.click(timeout=5000)
+                clicked = True
+                time.sleep(1)
+                break
+
+        except Exception as e:
+            log_warn(f"[{tag}] [{name}] 选项{btn_idx+1} 处理出错: {e}")
+            continue
+
+    if not clicked:
+        log_warn(f"[{tag}] [{name}] 未找到匹配选项，关键词=「{keyword}」")
+    return clicked
+
+
 # ── 单个项目续期（真实 UI 点击 + 人机验证 + captcha_token 直调 API）──
 def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
     """
     在 /projects 页面：
       1. 找到该项目卡片里的 Renew 按钮并点击 → 弹出 Anti-bot confirmation 弹窗
       2. 点击 div.auth-captcha-inner 触发验证码请求
-      3. 监听网络响应，抓取后端返回的 captcha_token
-         （抓包确认：勾选复选框后，前端会请求一个独立接口，
-          返回形如 {"captcha_token": "eyJ..."} 的 JSON）
-      4. 拿到 token 后，不再依赖弹窗是否自动提交/是否有确认按钮，
-         直接携带 token 调用 POST /api/client/servers/{id}/upgrade/renew
-      5. 根据返回的 success / expires_at 判断结果
-    成功返回新的剩余天数（float，可能为 None 表示无法解析），失败抛异常。
+         - 若通过：直接抓 captcha_token
+         - 若触发二级图块挑战：调用 Claude Vision API 识别并点击正确图块，再等 captcha_token
+      3. 拿到 token 后直接 POST /api/client/servers/{id}/upgrade/renew
     """
     from playwright.sync_api import TimeoutError as PWTimeout
 
@@ -272,46 +398,30 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
             raise RuntimeError("续期确认弹窗未出现")
         screenshot(page, f"acct{idx}_renew_{identifier}_a_dialog")
 
-        # ── 3. 点击验证码复选框，触发 captcha_token 请求 ───────
+        # ── 3. 点击验证码复选框 ───────────────────────────────
         log(f"[{tag}] [{name}] 点击续期弹窗 captcha 复选框...")
         dialog.locator("div.auth-captcha-inner").click(timeout=10000)
+        time.sleep(1)
 
-        # ── 4. 轮询等待 captcha_token 被网络监听捕获（最多 30s）──
-        # 期间检测是否弹出了"点击图块"这类二级挑战（风控升级），
-        # 一旦发现就立刻导出弹窗完整 HTML，方便后续针对性写选择器，
-        # 不用干等 30s 浪费时间。
-        challenge_dumped = False
-        for i in range(30):
+        # ── 4. 检测并处理二级图块挑战 ────────────────────────
+        solve_image_challenge(page, dialog, tag, name, idx, identifier)
+
+        # ── 5. 轮询等待 captcha_token（最多 40s，图块选择后需要服务端额外验证）──
+        for _ in range(40):
             if captcha_token_holder["token"]:
                 break
-            if not challenge_dumped and i >= 3:
-                try:
-                    dialog_html = dialog.evaluate("el => el.outerHTML")
-                    if "auth-captcha-inner" not in dialog_html or "Cliquez" in dialog_html \
-                       or "Click on" in dialog_html or "select" in dialog_html.lower():
-                        os.makedirs("screenshots", exist_ok=True)
-                        dump_path = f"screenshots/acct{idx}_renew_{identifier}_challenge_dump.html"
-                        with open(dump_path, "w", encoding="utf-8") as f:
-                            f.write(dialog_html)
-                        log_warn(f"[{tag}] [{name}] 检测到可能的二级验证挑战，"
-                                 f"已导出弹窗 HTML 到 {dump_path}")
-                        screenshot(page, f"acct{idx}_renew_{identifier}_b1_challenge")
-                        challenge_dumped = True
-                except Exception:
-                    pass
             time.sleep(1)
 
         screenshot(page, f"acct{idx}_renew_{identifier}_b_captcha")
 
         if not captcha_token_holder["token"]:
-            extra = "（弹窗 HTML 已导出，见 artifact 中的 challenge_dump.html）" if challenge_dumped else ""
-            raise RuntimeError(f"30s 内未捕获到 captcha_token，验证码请求可能未触发{extra}")
+            raise RuntimeError("40s 内未捕获到 captcha_token，验证码验证失败")
 
         token = captcha_token_holder["token"]
         log(f"[{tag}] [{name}] captcha_token 已捕获（来源: {captcha_token_holder['source_url']}），"
             f"直接调用续期接口")
 
-        # ── 5. 携带 token 直接调用续期 API ──────────────────
+        # ── 6. 携带 token 直接调用续期 API ──────────────────
         renew_url = f"/api/client/servers/{identifier}/upgrade/renew"
         result = page.evaluate("""async ({url, token}) => {
             const xsrf = decodeURIComponent(
@@ -344,9 +454,9 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
 
         log(f"[{tag}] [{name}] 续期成功 ✅ {data.get('message', '')}")
 
-        # ── 6. 尝试关闭弹窗（如果还开着，不强制要求成功）──────
+        # ── 7. 尝试关闭弹窗（不强制要求成功）────────────────
         try:
-            cancel_btn = dialog.locator("button:has-text('Cancel')").first
+            cancel_btn = dialog.locator("button:has-text('Annuler'), button:has-text('Cancel')").first
             if cancel_btn.is_visible(timeout=1000):
                 cancel_btn.click(timeout=2000)
         except Exception:

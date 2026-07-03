@@ -13,6 +13,7 @@ import re
 import sys
 import json
 import time
+import random
 import traceback
 from urllib.request import Request, urlopen
 
@@ -403,6 +404,26 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
             raise RuntimeError("续期确认弹窗未出现")
         screenshot(page, f"acct{idx}_renew_{identifier}_a_dialog")
 
+        # ── 2b. 模拟真人停顿 ──────────────────────────────────
+        # 前端会把"弹窗出现到点击验证码"这段耗时（elapsed）连同签名
+        # 一起发给服务器（payload 里的 context: renewal_gate）。
+        # 弹窗一出现就立刻点，elapsed 会是几十/几百毫秒，跟真人行为
+        # （通常几秒到十几秒）差距明显，容易被判定为可疑。这里加一段
+        # 随机延迟，顺便小幅移动一下鼠标，让这个耗时特征更自然。
+        human_delay = random.uniform(3.0, 8.0)
+        log(f"[{tag}] [{name}] 模拟真人停顿 {human_delay:.1f}s...")
+        try:
+            box = dialog.bounding_box()
+            if box:
+                page.mouse.move(
+                    box["x"] + box["width"] * random.uniform(0.3, 0.7),
+                    box["y"] + box["height"] * random.uniform(0.2, 0.5),
+                    steps=random.randint(5, 15),
+                )
+        except Exception:
+            pass
+        time.sleep(human_delay)
+
         # ── 3. 点击验证码复选框 ───────────────────────────────
         log(f"[{tag}] [{name}] 点击续期弹窗 captcha 复选框...")
         dialog.locator("div.auth-captcha-inner").click(timeout=10000)
@@ -576,6 +597,11 @@ def run_account(account: dict):
                     continue
 
             screenshot(page, f"acct{idx}_02_form_filled")
+
+            # ── 2b. 模拟真人停顿（同续期弹窗的道理，填完表单不会立刻点验证码）──
+            human_delay = random.uniform(2.0, 6.0)
+            log(f"[{tag}] 模拟真人停顿 {human_delay:.1f}s...")
+            time.sleep(human_delay)
 
             # ── 3. captcha ────────────────────────────────
             log(f"[{tag}] 点击 captcha 复选框...")

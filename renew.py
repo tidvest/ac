@@ -151,6 +151,26 @@ def parse_expires(text):
     total = days + hours / 24 + minutes / 1440
     return total if total > 0 else None
 
+# ── 重新查询指定项目的剩余时间（用于续期后二次核实）───────────
+def fetch_project_remaining(page, identifier: str):
+    """重新调用 /api/client（只读，不会触发限流），
+    找到 identifier 匹配的项目，返回当前剩余天数；查不到返回 None。"""
+    try:
+        result = page.evaluate("""async () => {
+            const r = await fetch('/api/client', {headers: {'Accept': 'application/json'}});
+            return {status: r.status, body: await r.text()};
+        }""")
+        if result['status'] != 200:
+            return None
+        data = json.loads(result['body'])
+        for item in data.get('data', []):
+            attrs = item.get('attributes') or {}
+            if attrs.get('identifier') == identifier:
+                return parse_expires(attrs.get('expires_at'))
+        return None
+    except Exception:
+        return None
+
 # ── 截图工具（涂抹敏感区域）────────────────────────────────
 def screenshot(page, name: str):
     os.makedirs("screenshots", exist_ok=True)
@@ -708,14 +728,26 @@ def run_account(account: dict):
                     continue
 
                 try:
-                    new_remaining = renew_via_ui(page, tag, name, identifier, idx)
-                    if new_remaining is not None:
-                        log(f"[{tag}] [{name}] 续期成功 ✅ {remaining:.2f}天 → {new_remaining:.2f}天")
+                    # 续期动作本身返回的结果（网络监听/弹窗消失）只是参考，
+                    # 不完全可信——真正靠谱的做法是续期前后各读一次真实的
+                    # 过期时间，用差值来判断是否真的续期成功。
+                    renew_via_ui(page, tag, name, identifier, idx)
+
+                    time.sleep(2)  # 给服务器一点时间落库
+                    fresh_remaining = fetch_project_remaining(page, identifier)
+
+                    if fresh_remaining is None:
+                        log_warn(f"[{tag}] [{name}] 续期后无法重新查询过期时间，无法确认是否成功")
+                        failed_list.append(f"{tag} · {name}（续期后无法确认结果）")
+                    elif fresh_remaining > remaining + 0.05:
+                        log(f"[{tag}] [{name}] 续期成功 ✅ {remaining:.2f}天 → {fresh_remaining:.2f}天")
                         renewed_list.append(
-                            f"{tag} · {name}（{remaining:.1f}天 → {new_remaining:.1f}天）")
+                            f"{tag} · {name}（{remaining:.1f}天 → {fresh_remaining:.1f}天）")
                     else:
-                        log(f"[{tag}] [{name}] 续期成功 ✅（无法查询新过期时间）")
-                        renewed_list.append(f"{tag} · {name}（续期前 {remaining:.1f} 天）")
+                        log_warn(f"[{tag}] [{name}] 续期前后剩余时间几乎没变化"
+                                  f"（{remaining:.2f}天 → {fresh_remaining:.2f}天），判定为未成功")
+                        failed_list.append(
+                            f"{tag} · {name}（续期未生效，剩余仍为 {fresh_remaining:.1f}天）")
 
                 except Exception as e:
                     log_error(f"[{tag}][{name}] 续期异常: {e}")

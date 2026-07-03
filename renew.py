@@ -277,15 +277,35 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
         dialog.locator("div.auth-captcha-inner").click(timeout=10000)
 
         # ── 4. 轮询等待 captcha_token 被网络监听捕获（最多 30s）──
-        for _ in range(30):
+        # 期间检测是否弹出了"点击图块"这类二级挑战（风控升级），
+        # 一旦发现就立刻导出弹窗完整 HTML，方便后续针对性写选择器，
+        # 不用干等 30s 浪费时间。
+        challenge_dumped = False
+        for i in range(30):
             if captcha_token_holder["token"]:
                 break
+            if not challenge_dumped and i >= 3:
+                try:
+                    dialog_html = dialog.evaluate("el => el.outerHTML")
+                    if "auth-captcha-inner" not in dialog_html or "Cliquez" in dialog_html \
+                       or "Click on" in dialog_html or "select" in dialog_html.lower():
+                        os.makedirs("screenshots", exist_ok=True)
+                        dump_path = f"screenshots/acct{idx}_renew_{identifier}_challenge_dump.html"
+                        with open(dump_path, "w", encoding="utf-8") as f:
+                            f.write(dialog_html)
+                        log_warn(f"[{tag}] [{name}] 检测到可能的二级验证挑战，"
+                                 f"已导出弹窗 HTML 到 {dump_path}")
+                        screenshot(page, f"acct{idx}_renew_{identifier}_b1_challenge")
+                        challenge_dumped = True
+                except Exception:
+                    pass
             time.sleep(1)
 
         screenshot(page, f"acct{idx}_renew_{identifier}_b_captcha")
 
         if not captcha_token_holder["token"]:
-            raise RuntimeError("30s 内未捕获到 captcha_token，验证码请求可能未触发")
+            extra = "（弹窗 HTML 已导出，见 artifact 中的 challenge_dump.html）" if challenge_dumped else ""
+            raise RuntimeError(f"30s 内未捕获到 captcha_token，验证码请求可能未触发{extra}")
 
         token = captcha_token_holder["token"]
         log(f"[{tag}] [{name}] captcha_token 已捕获（来源: {captcha_token_holder['source_url']}），"
@@ -343,7 +363,29 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
             pass
 
 
-# ── 单账号续期 ────────────────────────────────────────────
+# ── 反检测：隐藏 Playwright/Chromium 自动化特征 ──────────────
+STEALTH_INIT_SCRIPT = """
+() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5].map(() => ({ name: 'Chrome PDF Plugin' }))
+    });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    window.chrome = window.chrome || { runtime: {} };
+    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (originalQuery) {
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : originalQuery(parameters)
+        );
+    }
+    delete navigator.__proto__.webdriver;
+}
+"""
+
 def run_account(account: dict):
     """对单个账号执行续期，返回 (renewed_list, skipped_list, failed_list)"""
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -363,7 +405,10 @@ def run_account(account: dict):
     with sync_playwright() as p:
         os.makedirs("screenshots", exist_ok=True)
         browser = p.chromium.launch(
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
             proxy={"server": PROXY_SERVER},
         )
 
@@ -381,6 +426,7 @@ def run_account(account: dict):
             log(f"[{tag}] 录屏已开启")
 
         ctx  = browser.new_context(**ctx_kwargs)
+        ctx.add_init_script(STEALTH_INIT_SCRIPT)
         page = ctx.new_page()
 
         try:

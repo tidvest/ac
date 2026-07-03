@@ -34,6 +34,7 @@ jobs:
 
       - name: 安装依赖
         run: |
+          sudo apt-get install -y tesseract-ocr
           pip install -r requirements.txt
           playwright install chromium --with-deps
 
@@ -72,6 +73,8 @@ jobs:
           TG_CHAT_ID:        ${{ secrets.TG_CHAT_ID }}
           WXPUSHER_APPTOKEN: ${{ secrets.WXPUSHER_APPTOKEN }}
           WXPUSHER_UID:      ${{ secrets.WXPUSHER_UID }}
+          # ── Claude Vision（图块验证码识别）────────────
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # ── 录屏：手动触发时可选，schedule 默认 false ─
           ENABLE_VIDEO: ${{ github.event.inputs.enable_video || 'false' }}
         run: |

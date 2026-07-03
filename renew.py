@@ -358,19 +358,28 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
 
     card = page.locator("div.client-card", has_text=name).first
 
-    # 监听前端自动发出的续期 API 响应
+    # 监听前端自动发出的续期 API 响应（只监听 /upgrade/renew，忽略 GET 查询）
     renew_result_holder = {"status": None, "body": None, "url": None}
 
     def _on_response(res):
         try:
-            if f"/upgrade/renew" in res.url or f"servers/{identifier}" in res.url:
-                ctype = res.headers.get("content-type") or ""
-                if "application/json" in ctype:
-                    body_text = res.text()
-                    renew_result_holder["status"] = res.status
-                    renew_result_holder["body"]   = body_text
-                    renew_result_holder["url"]    = res.url
-                    log(f"[{tag}] [{name}] 捕获到服务器响应 {res.status} from {res.url}: {body_text[:200]}")
+            # 只关心 /upgrade/renew 接口
+            if "/upgrade/renew" not in res.url:
+                return
+            ctype = res.headers.get("content-type") or ""
+            if "application/json" not in ctype:
+                return
+            body_text = res.text()
+            log(f"[{tag}] [{name}] 捕获到续期响应 HTTP {res.status} from {res.url}: {body_text[:300]}")
+            # 忽略点击 Renew 按钮时触发的第一个 403（captcha_required，验证前正常触发）
+            if res.status == 403:
+                log(f"[{tag}] [{name}] 忽略 403 captcha_required（验证前触发，正常）")
+                return
+            # 第一个非 403 的续期响应才是验证通过后的真正结果
+            if renew_result_holder["status"] is None:
+                renew_result_holder["status"] = res.status
+                renew_result_holder["body"]   = body_text
+                renew_result_holder["url"]    = res.url
         except Exception as e:
             log_warn(f"[{tag}] [{name}] 响应监听出错: {e}")
 
@@ -431,19 +440,27 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
             # 从拦截到的响应判断
             status = renew_result_holder["status"]
             body_text = renew_result_holder["body"] or ""
-            log(f"[{tag}] [{name}] 续期响应 HTTP {status}: {body_text[:200]}")
+            log(f"[{tag}] [{name}] 续期响应 HTTP {status}: {body_text[:300]}")
+            if status == 429:
+                raise RuntimeError(f"续期被限流（429 Too Many Attempts），请等待冷却后重试: {body_text[:200]}")
             if status != 200:
                 raise RuntimeError(f"续期请求失败 HTTP {status}: {body_text[:200]}")
             try:
                 data = json.loads(body_text)
             except Exception:
                 raise RuntimeError(f"续期响应无法解析为 JSON: {body_text[:200]}")
-            if not data.get("success"):
-                raise RuntimeError(f"续期返回失败: {data.get('message', '未知错误')}")
-            log(f"[{tag}] [{name}] 续期成功 ✅ {data.get('message', '')}")
-            if data.get("expires_at"):
-                return parse_expires(data["expires_at"])
-            return None
+            # 成功判断：有 success=true，或者响应里包含 expires_at（部分面板直接返回服务器对象）
+            if data.get("success"):
+                log(f"[{tag}] [{name}] 续期成功 ✅ {data.get('message', '')}")
+                if data.get("expires_at"):
+                    return parse_expires(data["expires_at"])
+                return None
+            # 有些面板续期成功后直接返回 server 对象（含 attributes.expires_at）
+            attrs = data.get("attributes", {})
+            if attrs.get("expires_at"):
+                log(f"[{tag}] [{name}] 续期成功 ✅（server 对象响应）")
+                return parse_expires(attrs["expires_at"])
+            raise RuntimeError(f"续期返回失败: {data.get('message', '未知错误')} | body: {body_text[:200]}")
 
         elif dialog_gone:
             # 弹窗消失但没有拦截到响应 → 等一下再刷页面查真实剩余天数

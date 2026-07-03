@@ -358,26 +358,31 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
 
     card = page.locator("div.client-card", has_text=name).first
 
-    # 监听 captcha 验证接口，拿到 token 后自己调续期 API
-    # captcha 接口返回: {"passed": true, "token": "eyJ..."}
-    captcha_token_holder = {"token": None}
+    # 注意：点击 Renew 按钮弹窗出现的瞬间，前端会自动先打一次
+    # /upgrade/renew（此时验证码还没做，必然失败/被拒绝）。
+    # 之前的版本从一开始就监听响应，结果永远抓到的是这条"注定失败"的
+    # 请求，后面验证码做完、真正成功的那次反而被忽略了。
+    # 现在改成：监听器延后到验证码流程走完之后才注册，
+    # 这样根本不会捕获到那条必败的早期请求。
+    renew_result_holder = {"status": None, "body": None}
 
     def _on_response(res):
         try:
-            if "/auth/captcha" not in res.url:
+            if "/upgrade/renew" not in res.url:
                 return
             ctype = res.headers.get("content-type") or ""
-            if "application/json" not in ctype:
-                return
-            body = res.json()
-            if isinstance(body, dict) and body.get("passed") and body.get("token"):
-                if not captcha_token_holder["token"]:
-                    captcha_token_holder["token"] = body["token"]
-                    log(f"[{tag}] [{name}] captcha token 已捕获（来源: {res.url}）")
+            body_text = None
+            if "application/json" in ctype:
+                try:
+                    body_text = res.text()
+                except Exception:
+                    body_text = None
+            # 持续覆盖，保留最新一次匹配到的结果
+            renew_result_holder["status"] = res.status
+            renew_result_holder["body"] = body_text
+            log(f"[{tag}] [{name}] 捕获到续期请求响应: HTTP {res.status}（来源: {res.url}）")
         except Exception as e:
             log_warn(f"[{tag}] [{name}] 响应监听出错: {e}")
-
-    page.on("response", _on_response)
 
     try:
         # ── 1. 点击 Renew 按钮 ─────────────────────────────
@@ -408,41 +413,37 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
 
         screenshot(page, f"acct{idx}_renew_{identifier}_b_after_captcha")
 
-        # ── 5. 等待 captcha token（最多 30s）────────────────
-        log(f"[{tag}] [{name}] 等待 captcha token（最多30s）...")
+        # ── 4b. 验证码流程走完后才开始监听 ───────────────────
+        # 关键：不能在点 Renew 按钮之前就监听，因为弹窗刚出现时前端
+        # 会自动先打一次 /upgrade/renew（验证码还没做，必然失败），
+        # 提前监听只会抓到这条必败请求。这里验证码流程结束后才注册，
+        # 保证只捕获验证通过后真正提交的那次请求结果。
+        page.on("response", _on_response)
+
+        # ── 5. 被动等待前端自己发起 /upgrade/renew 请求（最多 30s）──
+        # 验证码通过后，前端 JS 会自动提交续期请求，我们不用（也不该）
+        # 自己去拼这个请求——手动拼的请求会被服务器判 429，真实点击
+        # 触发的不会，说明这里必须让浏览器按正常流程走。
+        log(f"[{tag}] [{name}] 等待前端自动提交续期请求（最多30s）...")
         for _ in range(30):
-            if captcha_token_holder["token"]:
+            if renew_result_holder["status"] is not None:
                 break
             time.sleep(1)
 
-        if not captcha_token_holder["token"]:
-            raise RuntimeError("30s 内未捕获到 captcha token，图块验证未通过或超时")
-
-        token = captcha_token_holder["token"]
-
-        # ── 6. 携带 token 调用续期 API ───────────────────────
-        renew_url = f"/api/client/servers/{identifier}/upgrade/renew"
-        log(f"[{tag}] [{name}] 调用续期接口 {renew_url}")
-        result = page.evaluate("""async ({url, token}) => {
-            const xsrf = decodeURIComponent(
-                (document.cookie.match(/XSRF-TOKEN=([^;]+)/) || [])[1] || ''
-            );
-            const r = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'X-XSRF-TOKEN': xsrf
-                },
-                body: JSON.stringify({captcha_token: token})
-            });
-            return {status: r.status, body: await r.text()};
-        }""", {"url": renew_url, "token": token})
-
         screenshot(page, f"acct{idx}_renew_{identifier}_c_result")
 
-        status = result["status"]
-        body_text = result["body"] or ""
+        if renew_result_holder["status"] is None:
+            # 兜底：没抓到网络请求，看弹窗是否已经消失（可能是前端没走
+            # fetch 而是别的方式提交，或者响应类型不是 json 被我们漏检了）
+            try:
+                dialog.wait_for(state="hidden", timeout=5000)
+                log(f"[{tag}] [{name}] 未捕获到续期响应，但弹窗已消失，视为成功")
+                return None
+            except Exception:
+                raise RuntimeError("30s 内未捕获到续期请求，也未见弹窗消失，图块验证可能未通过")
+
+        status = renew_result_holder["status"]
+        body_text = renew_result_holder["body"] or ""
         log(f"[{tag}] [{name}] 续期响应 HTTP {status}: {body_text[:300]}")
 
         if status == 429:
@@ -453,7 +454,9 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
         try:
             data = json.loads(body_text)
         except Exception:
-            raise RuntimeError(f"续期响应无法解析为 JSON: {body_text[:200]}")
+            # 拿到200但解析不了body，弹窗一般也会自己消失，按成功处理
+            log_warn(f"[{tag}] [{name}] 续期响应200但无法解析JSON，按成功处理: {body_text[:200]}")
+            return None
 
         if not data.get("success"):
             raise RuntimeError(f"续期返回失败: {data.get('message', '未知错误')}")

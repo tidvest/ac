@@ -253,11 +253,15 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
     try:
         # ── 1. 点击 Renew 按钮 ─────────────────────────────
         log(f"[{tag}] [{name}] 查找并点击 Renew 按钮...")
-        renew_btn = card.locator("button.client-btn--secondary", has_text="Renew").first
+        # 不依赖按钮文字（面板语言按账号不同可能是 Renew/Renouveler/续订 等），
+        # 改为按 DOM 结构定位：续期按钮唯一地位于 div.projects-card-expiry 容器内，
+        # 与 Gérer/Modifier/Supprimer 所在的 div.projects-card-actions 是分开的区块。
+        renew_btn = card.locator("div.projects-card-expiry button.client-btn").first
         try:
             renew_btn.wait_for(state="visible", timeout=10000)
         except PWTimeout:
-            raise RuntimeError("找不到该项目的 Renew 按钮")
+            raise RuntimeError("找不到该项目的续期按钮（div.projects-card-expiry 内无可见按钮，"
+                                "可能已续期过或结构变了）")
         renew_btn.click()
 
         # ── 2. 等待人机验证弹窗出现 ──────────────────────────

@@ -626,8 +626,17 @@ def run_account(account: dict):
             # ── 3. captcha ────────────────────────────────
             log(f"[{tag}] 点击 captcha 复选框...")
             page.click("div.auth-captcha-inner", timeout=10000)
+            time.sleep(1)
+
+            # ── 3b. 检测并处理二级图块挑战（登录页与续期弹窗共用同一套组件）──
+            # solve_image_challenge 原本接收一个 dialog locator，
+            # 登录页没有外层 dialog，直接传 page（同样支持 .locator()）
+            solve_image_challenge(page, page, tag, f"登录({email_masked})", idx, "login")
+
+            screenshot(page, f"acct{idx}_02b_captcha")
+
+            # ── 3c. 等待验证通过（一级直接过 or 图块选完后自动通过）──
             captcha_verified = False
-            # 第一轮：等待 10 秒（网络快时通常够用）
             try:
                 page.wait_for_selector(
                     "div.auth-captcha-box.verified, div.auth-captcha-inner[aria-checked='true']",
@@ -636,7 +645,6 @@ def run_account(account: dict):
                 log(f"[{tag}] captcha 验证通过 ✅")
             except Exception:
                 log_warn(f"[{tag}] captcha 10s 内未验证，继续等待最多 20s...")
-                # 第二轮：网络慢时额外轮询 20 秒
                 for _ in range(20):
                     time.sleep(1)
                     try:
@@ -650,7 +658,6 @@ def run_account(account: dict):
                         continue
                 if not captcha_verified:
                     log_warn(f"[{tag}] captcha 30s 后仍未验证，强行提交（可能失败）")
-            screenshot(page, f"acct{idx}_02b_captcha")
 
             # ── 4. 提交登录 ───────────────────────────────
             for sel in ["button[type='submit']", "button:has-text('Login')",

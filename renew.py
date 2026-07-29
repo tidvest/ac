@@ -350,8 +350,28 @@ def solve_image_challenge(page, dialog, tag: str, name: str, idx: int, identifie
             recognized = ocr_image_bytes(img_bytes, debug_path=debug_path)
             log(f"[{tag}] [{name}] 选项{btn_idx+1} OCR结果: 「{recognized}」")
 
-            if keyword.lower() in recognized.lower() or recognized.lower() in keyword.lower():
-                log(f"[{tag}] [{name}] ✅ 匹配！点击选项 {btn_idx+1}")
+            kw = keyword.lower()
+            rc = recognized.lower()
+            # 1. 精确包含匹配
+            exact_match = kw in rc or rc in kw
+            # 2. 编辑距离模糊匹配：容忍每4字符最多1个识别错误
+            def _levenshtein(a, b):
+                if not a: return len(b)
+                if not b: return len(a)
+                dp = list(range(len(b) + 1))
+                for i, ca in enumerate(a):
+                    ndp = [i + 1]
+                    for j, cb in enumerate(b):
+                        ndp.append(min(dp[j] + (0 if ca == cb else 1),
+                                       dp[j + 1] + 1, ndp[j] + 1))
+                    dp = ndp
+                return dp[-1]
+            dist = _levenshtein(kw, rc)
+            max_dist = max(1, len(kw) // 3)  # 每3字符容忍1个误差
+            fuzzy_match = dist <= max_dist
+            if exact_match or fuzzy_match:
+                match_type = "精确" if exact_match else f"模糊(编辑距离{dist}≤{max_dist})"
+                log(f"[{tag}] [{name}] ✅ {match_type}匹配！点击选项 {btn_idx+1}")
                 btn.click(timeout=5000)
                 clicked = True
                 time.sleep(1)
@@ -516,7 +536,11 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
         log(f"[{tag}] [{name}] 检测到 Suspended 状态，先执行 Reactivate...")
         # Reactivate 按钮在 div.projects-card-expiry 或 div.projects-card-body 里
         reactivate_btn = card.locator(
-            "button.client-btn-warning, button:has-text('Reactivate')"
+            "button.client-btn--warning, "
+            "button.client-btn-warning, "
+            "button:has-text('Reactivate'), "
+            "button:has-text('Réactiver'), "
+            "button:has-text('Reactivar')"
         ).first
         try:
             reactivate_btn.wait_for(state="visible", timeout=8000)
@@ -559,7 +583,7 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
     # ── 1. 点击续期 Renew 按钮 ──────────────────────────────────
     log(f"[{tag}] [{name}] 查找并点击 Renew 按钮...")
     renew_btn = card.locator(
-        "div.projects-card-expiry button.client-btn:not(.client-btn-warning)"
+        "div.projects-card-expiry button.client-btn:not(.client-btn--warning):not(.client-btn-warning)"
     ).first
     try:
         renew_btn.wait_for(state="visible", timeout=10000)

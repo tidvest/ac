@@ -365,31 +365,20 @@ def solve_image_challenge(page, dialog, tag: str, name: str, idx: int, identifie
     return clicked
 
 
-# ── 单个项目续期（真实 UI 点击 + 人机验证，让前端完成续期）──
-def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
+# ── 点击按钮 + 走 captcha 弹窗（续期和激活共用）────────────────
+def _click_with_captcha(page, tag: str, name: str, identifier: str, idx: int,
+                        btn_locator, action_label: str, api_url_fragment: str,
+                        result_holder: dict, screenshot_prefix: str):
     """
-    在 /projects 页面：
-      1. 找到该项目卡片里的 Renew 按钮并点击 → 弹出 Anti-bot confirmation 弹窗
-      2. 点击 div.auth-captcha-inner 触发验证码请求
-         - 若直接通过（一级）：前端自动提交续期请求，弹窗消失
-         - 若触发二级图块挑战：OCR 识别并点击正确图块，前端提交续期请求，弹窗消失
-      3. 监听前端发出的 /upgrade/renew 请求结果，或等弹窗消失来判断成功
+    通用：点击一个按钮 → 等弹窗 → 走 captcha（一级/二级图块）→ 监听 API 响应。
+    result_holder: {"status": None, "body": None}，函数内写入结果
+    screenshot_prefix: 截图文件名前缀，如 "acct1_renew_tgs" / "acct1_reactivate_tgs"
     """
     from playwright.sync_api import TimeoutError as PWTimeout
 
-    card = page.locator("div.client-card", has_text=name).first
-
-    # 注意：点击 Renew 按钮弹窗出现的瞬间，前端会自动先打一次
-    # /upgrade/renew（此时验证码还没做，必然失败/被拒绝）。
-    # 之前的版本从一开始就监听响应，结果永远抓到的是这条"注定失败"的
-    # 请求，后面验证码做完、真正成功的那次反而被忽略了。
-    # 现在改成：监听器延后到验证码流程走完之后才注册，
-    # 这样根本不会捕获到那条必败的早期请求。
-    renew_result_holder = {"status": None, "body": None}
-
     def _on_response(res):
         try:
-            if "/upgrade/renew" not in res.url:
+            if api_url_fragment not in res.url:
                 return
             ctype = res.headers.get("content-type") or ""
             body_text = None
@@ -398,38 +387,27 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
                     body_text = res.text()
                 except Exception:
                     body_text = None
-            # 持续覆盖，保留最新一次匹配到的结果
-            renew_result_holder["status"] = res.status
-            renew_result_holder["body"] = body_text
-            log(f"[{tag}] [{name}] 捕获到续期请求响应: HTTP {res.status}（来源: {res.url}）")
+            result_holder["status"] = res.status
+            result_holder["body"] = body_text
+            log(f"[{tag}] [{name}] 捕获到{action_label}请求响应: HTTP {res.status}")
         except Exception as e:
             log_warn(f"[{tag}] [{name}] 响应监听出错: {e}")
 
     try:
-        # ── 1. 点击 Renew 按钮 ─────────────────────────────
-        log(f"[{tag}] [{name}] 查找并点击 Renew 按钮...")
-        renew_btn = card.locator("div.projects-card-expiry button.client-btn").first
-        try:
-            renew_btn.wait_for(state="visible", timeout=10000)
-        except PWTimeout:
-            raise RuntimeError("找不到该项目的续期按钮（div.projects-card-expiry 内无可见按钮，"
-                                "可能已续期过或结构变了）")
-        renew_btn.click()
+        log(f"[{tag}] [{name}] 点击 {action_label} 按钮...")
+        btn_locator.click()
 
-        # ── 2. 等待人机验证弹窗出现 ──────────────────────────
-        dialog = page.locator("div[role='dialog'][aria-labelledby='renew-captcha-title']").first
+        # 等待含 captcha 的弹窗出现
+        dialog = page.locator("div[role='dialog']").filter(
+            has=page.locator("div.auth-captcha-inner")
+        ).first
         try:
             dialog.wait_for(state="visible", timeout=10000)
         except PWTimeout:
-            raise RuntimeError("续期确认弹窗未出现")
-        screenshot(page, f"acct{idx}_renew_{identifier}_a_dialog")
+            raise RuntimeError(f"{action_label}确认弹窗未出现")
+        screenshot(page, f"{screenshot_prefix}_a_dialog")
 
-        # ── 2b. 模拟真人停顿 ──────────────────────────────────
-        # 前端会把"弹窗出现到点击验证码"这段耗时（elapsed）连同签名
-        # 一起发给服务器（payload 里的 context: renewal_gate）。
-        # 弹窗一出现就立刻点，elapsed 会是几十/几百毫秒，跟真人行为
-        # （通常几秒到十几秒）差距明显，容易被判定为可疑。这里加一段
-        # 随机延迟，顺便小幅移动一下鼠标，让这个耗时特征更自然。
+        # 模拟真人停顿
         human_delay = random.uniform(3.0, 8.0)
         log(f"[{tag}] [{name}] 模拟真人停顿 {human_delay:.1f}s...")
         try:
@@ -444,74 +422,173 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
             pass
         time.sleep(human_delay)
 
-        # ── 3. 点击验证码复选框 ───────────────────────────────
-        log(f"[{tag}] [{name}] 点击续期弹窗 captcha 复选框...")
+        # 点击验证码复选框
+        log(f"[{tag}] [{name}] 点击 {action_label} 弹窗 captcha 复选框...")
         dialog.locator("div.auth-captcha-inner").click(timeout=10000)
         time.sleep(1)
 
-        # ── 4. 检测并处理二级图块挑战 ────────────────────────
+        # 检测并处理二级图块挑战
         solve_image_challenge(page, dialog, tag, name, idx, identifier)
 
-        screenshot(page, f"acct{idx}_renew_{identifier}_b_after_captcha")
+        screenshot(page, f"{screenshot_prefix}_b_after_captcha")
 
-        # ── 4b. 验证码流程走完后才开始监听 ───────────────────
-        # 关键：不能在点 Renew 按钮之前就监听，因为弹窗刚出现时前端
-        # 会自动先打一次 /upgrade/renew（验证码还没做，必然失败），
-        # 提前监听只会抓到这条必败请求。这里验证码流程结束后才注册，
-        # 保证只捕获验证通过后真正提交的那次请求结果。
+        # 验证码流程走完后才开始监听（避免捕获到弹窗出现时前端自动发的必败请求）
         page.on("response", _on_response)
 
-        # ── 5. 被动等待前端自己发起 /upgrade/renew 请求（最多 30s）──
-        # 验证码通过后，前端 JS 会自动提交续期请求，我们不用（也不该）
-        # 自己去拼这个请求——手动拼的请求会被服务器判 429，真实点击
-        # 触发的不会，说明这里必须让浏览器按正常流程走。
-        log(f"[{tag}] [{name}] 等待前端自动提交续期请求（最多30s）...")
+        log(f"[{tag}] [{name}] 等待前端自动提交{action_label}请求（最多30s）...")
         for _ in range(30):
-            if renew_result_holder["status"] is not None:
+            if result_holder["status"] is not None:
                 break
             time.sleep(1)
 
-        screenshot(page, f"acct{idx}_renew_{identifier}_c_result")
+        screenshot(page, f"{screenshot_prefix}_c_result")
 
-        if renew_result_holder["status"] is None:
-            # 兜底：没抓到网络请求，看弹窗是否已经消失（可能是前端没走
-            # fetch 而是别的方式提交，或者响应类型不是 json 被我们漏检了）
+        if result_holder["status"] is None:
+            # 兜底：没抓到网络请求，看弹窗是否已消失
             try:
                 dialog.wait_for(state="hidden", timeout=5000)
-                log(f"[{tag}] [{name}] 未捕获到续期响应，但弹窗已消失，视为成功")
-                return None
+                log(f"[{tag}] [{name}] 未捕获到{action_label}响应，但弹窗已消失，视为成功")
+                return
             except Exception:
-                raise RuntimeError("30s 内未捕获到续期请求，也未见弹窗消失，图块验证可能未通过")
+                raise RuntimeError(f"30s 内未捕获到{action_label}请求，也未见弹窗消失")
 
-        status = renew_result_holder["status"]
-        body_text = renew_result_holder["body"] or ""
-        log(f"[{tag}] [{name}] 续期响应 HTTP {status}: {body_text[:300]}")
+        status = result_holder["status"]
+        body_text = result_holder["body"] or ""
+        log(f"[{tag}] [{name}] {action_label}响应 HTTP {status}: {body_text[:300]}")
 
         if status == 429:
-            raise RuntimeError(f"续期被限流（429 Too Many Attempts）: {body_text[:200]}")
+            raise RuntimeError(f"{action_label}被限流（429）: {body_text[:200]}")
         if status != 200:
-            raise RuntimeError(f"续期请求失败 HTTP {status}: {body_text[:200]}")
+            raise RuntimeError(f"{action_label}请求失败 HTTP {status}: {body_text[:200]}")
 
         try:
             data = json.loads(body_text)
         except Exception:
-            # 拿到200但解析不了body，弹窗一般也会自己消失，按成功处理
-            log_warn(f"[{tag}] [{name}] 续期响应200但无法解析JSON，按成功处理: {body_text[:200]}")
-            return None
+            log_warn(f"[{tag}] [{name}] {action_label}响应200但无法解析JSON，按成功处理")
+            return
 
         if not data.get("success"):
-            raise RuntimeError(f"续期返回失败: {data.get('message', '未知错误')}")
+            raise RuntimeError(f"{action_label}返回失败: {data.get('message', '未知错误')}")
 
-        log(f"[{tag}] [{name}] 续期成功 ✅ {data.get('message', '')}")
-        if data.get("expires_at"):
-            return parse_expires(data["expires_at"])
-        return None
+        log(f"[{tag}] [{name}] {action_label}成功 ✅ {data.get('message', '')}")
 
     finally:
         try:
             page.remove_listener("response", _on_response)
         except Exception:
             pass
+
+
+# ── 单个项目续期（真实 UI 点击 + 人机验证）────────────────────────
+def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
+    """
+    在 /projects 页面：
+      0. 若项目处于 Suspended 状态，先点击 Reactivate（也需要走 captcha）
+      1. 找到续期按钮 Renew 并点击 → 弹出 captcha 弹窗
+      2. 走 captcha（一级直接过 / 二级图块 OCR）
+      3. 监听 /upgrade/renew 响应确认结果
+    """
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    card = page.locator("div.client-card", has_text=name).first
+
+    # ── 0. 检测 Suspended 状态，先 Reactivate ────────────────────
+    is_suspended = False
+    try:
+        # suspended banner: div.projects-suspended-banner 或含 "Suspended" 文字的 banner
+        banner = card.locator("div.projects-suspended-banner, div[class*='suspended-banner']").first
+        banner.wait_for(state="visible", timeout=3000)
+        is_suspended = True
+    except Exception:
+        pass
+
+    if not is_suspended:
+        # 备用检测：卡片 class 含 projects-card-suspended
+        try:
+            card_class = card.get_attribute("class") or ""
+            if "suspended" in card_class.lower():
+                is_suspended = True
+        except Exception:
+            pass
+
+    if is_suspended:
+        log(f"[{tag}] [{name}] 检测到 Suspended 状态，先执行 Reactivate...")
+        # Reactivate 按钮在 div.projects-card-expiry 或 div.projects-card-body 里
+        reactivate_btn = card.locator(
+            "button.client-btn-warning, button:has-text('Reactivate')"
+        ).first
+        try:
+            reactivate_btn.wait_for(state="visible", timeout=8000)
+        except PWTimeout:
+            raise RuntimeError("找不到 Reactivate 按钮")
+
+        react_holder = {"status": None, "body": None}
+        _click_with_captcha(
+            page, tag, name, identifier, idx,
+            btn_locator=reactivate_btn,
+            action_label="激活",
+            # 实际 API 路径未知，用宽泛片段匹配；也可能是 reactivate/activate
+            api_url_fragment="/upgrade/",
+            result_holder=react_holder,
+            screenshot_prefix=f"acct{idx}_reactivate_{identifier}",
+        )
+
+        # 等待卡片刷新为非 suspended 状态（最多 15s）
+        log(f"[{tag}] [{name}] 等待激活后状态刷新...")
+        time.sleep(3)
+        try:
+            page.wait_for_function(
+                """(name) => {
+                    const cards = document.querySelectorAll('div.client-card');
+                    for (const c of cards) {
+                        if (c.textContent.includes(name)) {
+                            return !c.classList.contains('projects-card-suspended')
+                                   && !c.querySelector('div.projects-suspended-banner');
+                        }
+                    }
+                    return false;
+                }""",
+                arg=name,
+                timeout=15000,
+            )
+            log(f"[{tag}] [{name}] 激活成功，卡片已变为正常状态 ✅")
+        except Exception:
+            log_warn(f"[{tag}] [{name}] 激活后卡片状态未及时刷新，继续尝试续期...")
+
+    # ── 1. 点击续期 Renew 按钮 ──────────────────────────────────
+    log(f"[{tag}] [{name}] 查找并点击 Renew 按钮...")
+    renew_btn = card.locator(
+        "div.projects-card-expiry button.client-btn:not(.client-btn-warning)"
+    ).first
+    try:
+        renew_btn.wait_for(state="visible", timeout=10000)
+    except PWTimeout:
+        # 兜底：取 expiry 区域任意 button
+        renew_btn = card.locator("div.projects-card-expiry button").first
+        try:
+            renew_btn.wait_for(state="visible", timeout=5000)
+        except PWTimeout:
+            raise RuntimeError("找不到该项目的续期按钮（div.projects-card-expiry 内无可见按钮）")
+
+    renew_holder = {"status": None, "body": None}
+    _click_with_captcha(
+        page, tag, name, identifier, idx,
+        btn_locator=renew_btn,
+        action_label="续期",
+        api_url_fragment="/upgrade/renew",
+        result_holder=renew_holder,
+        screenshot_prefix=f"acct{idx}_renew_{identifier}",
+    )
+
+    # 返回新的过期时间（如果响应里有的话）
+    body_text = renew_holder.get("body") or ""
+    try:
+        data = json.loads(body_text)
+        if data.get("expires_at"):
+            return parse_expires(data["expires_at"])
+    except Exception:
+        pass
+    return None
 
 
 # ── 反检测：隐藏 Playwright/Chromium 自动化特征 ──────────────

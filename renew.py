@@ -30,8 +30,9 @@ WXPUSHER_APPTOKEN = os.environ.get("WXPUSHER_APPTOKEN", "").strip()
 WXPUSHER_UID      = os.environ.get("WXPUSHER_UID", "").strip()
 
 RENEW_THRESHOLD_DAYS = 2
-BASE_URL  = "https://dash.aclclouds.com"
-LOGIN_URL = f"{BASE_URL}/auth/login"
+LOGIN_URL    = "https://dash.aclclouds.com/auth/login"
+BASE_URL     = "https://aclclouds.com"
+PROJECTS_URL = f"{BASE_URL}/dashboard/projects"
 
 # ── 脱敏工具 ──────────────────────────────────────────────
 def mask_email(email: str) -> str:
@@ -789,7 +790,7 @@ def run_account(account: dict):
 
             # ── 6b. 跳转到项目页（续费按钮 / 验证码弹窗都在这个页面上渲染）──
             try:
-                page.goto(f"{BASE_URL}/projects", timeout=30000)
+                page.goto(PROJECTS_URL, timeout=30000)
                 page.wait_for_load_state("networkidle", timeout=20000)
             except Exception as e:
                 log_warn(f"[{tag}] 跳转 /projects 失败: {e}")

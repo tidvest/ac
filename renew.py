@@ -278,41 +278,67 @@ def ocr_image_bytes(img_bytes: bytes, debug_path: str = None) -> str:
         return ""
 
 
-def solve_image_challenge(page, dialog, tag: str, name: str, idx: int, identifier: str) -> bool:
-    """
-    处理二级图块挑战（div.auth-captcha-challenge）：
-      1. 读取题目关键词（div.auth-captcha-prompt strong 的文字）
-      2. 通过 page.evaluate fetch 在浏览器上下文内拉取图片并转 base64
-         （带登录 cookie，不需要外部下载，不需要 API key）
-      3. 用本地 Tesseract OCR 识别每张图的文字
-      4. 点击与关键词匹配的那个按钮
-    返回 True 表示已点击，False 表示未触发挑战（正常一级验证直接过）。
-    """
-    import base64, io
+def _levenshtein(a: str, b: str) -> int:
+    if not a: return len(b)
+    if not b: return len(a)
+    dp = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        ndp = [i + 1]
+        for j, cb in enumerate(b):
+            ndp.append(min(dp[j] + (0 if ca == cb else 1),
+                           dp[j + 1] + 1, ndp[j] + 1))
+        dp = ndp
+    return dp[-1]
 
-    challenge = dialog.locator("div.auth-captcha-challenge").first
-    try:
-        challenge.wait_for(state="visible", timeout=5000)
-    except Exception:
-        return False  # 没有二级挑战
+
+def _ocr_match(keyword: str, recognized: str) -> tuple[bool, str]:
+    """
+    判断 OCR 结果是否匹配关键词。
+    策略（按优先级）：
+      1. 完整词相等（大小写无关）
+      2. 双向包含且长度差 ≤ 2（防止 cloud 误匹配 aclclouds：len差=5 > 2，拒绝）
+      3. Levenshtein 编辑距离 ≤ max(1, len(kw)//3)
+    返回 (matched, 描述)
+    """
+    kw = keyword.lower().strip()
+    rc = recognized.lower().strip()
+    if not kw or not rc:
+        return False, "空字符串"
+    # 1. 完整词相等
+    if kw == rc:
+        return True, "完整词相等"
+    # 2. 双向包含，但限制长度差
+    if kw in rc and abs(len(kw) - len(rc)) <= 2:
+        return True, f"包含匹配(kw⊂rc, 长度差{abs(len(kw)-len(rc))})"
+    if rc in kw and abs(len(kw) - len(rc)) <= 2:
+        return True, f"包含匹配(rc⊂kw, 长度差{abs(len(kw)-len(rc))})"
+    # 3. 编辑距离
+    dist = _levenshtein(kw, rc)
+    max_dist = max(1, len(kw) // 3)
+    if dist <= max_dist:
+        return True, f"模糊匹配(编辑距离{dist}≤{max_dist})"
+    return False, f"不匹配(编辑距离{dist}>{max_dist})"
+
+
+def _do_one_image_challenge_round(page, dialog, challenge, tag: str, name: str,
+                                   idx: int, identifier: str, round_num: int) -> bool:
+    """单轮图块挑战：读关键词 → OCR → 点击匹配选项。返回是否点击了某个选项。"""
+    import base64
 
     # 读取题目关键词
     try:
         keyword = challenge.locator("div.auth-captcha-prompt strong").first.inner_text(timeout=3000).strip()
     except Exception:
         keyword = ""
-    log(f"[{tag}] [{name}] 图块挑战关键词: 「{keyword}」")
-    screenshot(page, f"acct{idx}_renew_{identifier}_challenge")
+    log(f"[{tag}] [{name}] [第{round_num}轮] 图块挑战关键词: 「{keyword}」")
 
     if not keyword:
-        log_warn(f"[{tag}] [{name}] 无法读取关键词，跳过图块挑战处理")
+        log_warn(f"[{tag}] [{name}] 无法读取关键词，跳过")
         return False
 
-    # 收集四个按钮
     option_btns = challenge.locator("button.auth-captcha-option").all()
     log(f"[{tag}] [{name}] 找到 {len(option_btns)} 个图块选项")
 
-    clicked = False
     for btn_idx, btn in enumerate(option_btns):
         try:
             img_el  = btn.locator("img.auth-captcha-option-img").first
@@ -320,7 +346,6 @@ def solve_image_challenge(page, dialog, tag: str, name: str, idx: int, identifie
             if not img_src:
                 continue
 
-            # 在浏览器上下文里用带 cookie 的 fetch 拉取图片 → base64
             b64 = page.evaluate("""async (src) => {
                 try {
                     const r = await fetch(src, {credentials: 'include'});
@@ -338,52 +363,89 @@ def solve_image_challenge(page, dialog, tag: str, name: str, idx: int, identifie
                 continue
 
             img_bytes = base64.b64decode(b64)
-
-            # 保存图片到 screenshots 方便调试
             os.makedirs("screenshots", exist_ok=True)
-            img_path = f"screenshots/acct{idx}_renew_{identifier}_opt{btn_idx+1}.png"
+            img_path = f"screenshots/acct{idx}_{identifier}_r{round_num}_opt{btn_idx+1}.png"
             with open(img_path, "wb") as f:
                 f.write(img_bytes)
 
-            # Tesseract OCR 识别，同时保存预处理后的图片用于调试
-            debug_path = f"screenshots/acct{idx}_renew_{identifier}_opt{btn_idx+1}_processed.png"
+            debug_path = f"screenshots/acct{idx}_{identifier}_r{round_num}_opt{btn_idx+1}_proc.png"
             recognized = ocr_image_bytes(img_bytes, debug_path=debug_path)
-            log(f"[{tag}] [{name}] 选项{btn_idx+1} OCR结果: 「{recognized}」")
+            log(f"[{tag}] [{name}] 选项{btn_idx+1} OCR: 「{recognized}」")
 
-            kw = keyword.lower()
-            rc = recognized.lower()
-            # 1. 精确包含匹配
-            exact_match = kw in rc or rc in kw
-            # 2. 编辑距离模糊匹配：容忍每4字符最多1个识别错误
-            def _levenshtein(a, b):
-                if not a: return len(b)
-                if not b: return len(a)
-                dp = list(range(len(b) + 1))
-                for i, ca in enumerate(a):
-                    ndp = [i + 1]
-                    for j, cb in enumerate(b):
-                        ndp.append(min(dp[j] + (0 if ca == cb else 1),
-                                       dp[j + 1] + 1, ndp[j] + 1))
-                    dp = ndp
-                return dp[-1]
-            dist = _levenshtein(kw, rc)
-            max_dist = max(1, len(kw) // 3)  # 每3字符容忍1个误差
-            fuzzy_match = dist <= max_dist
-            if exact_match or fuzzy_match:
-                match_type = "精确" if exact_match else f"模糊(编辑距离{dist}≤{max_dist})"
-                log(f"[{tag}] [{name}] ✅ {match_type}匹配！点击选项 {btn_idx+1}")
+            matched, reason = _ocr_match(keyword, recognized)
+            log(f"[{tag}] [{name}] 选项{btn_idx+1} 匹配结果: {reason}")
+            if matched:
+                log(f"[{tag}] [{name}] ✅ 点击选项 {btn_idx+1}（{reason}）")
                 btn.click(timeout=5000)
-                clicked = True
-                time.sleep(1)
-                break
+                time.sleep(1.5)
+                return True
 
         except Exception as e:
             log_warn(f"[{tag}] [{name}] 选项{btn_idx+1} 处理出错: {e}")
             continue
 
-    if not clicked:
-        log_warn(f"[{tag}] [{name}] 未找到匹配选项，关键词=「{keyword}」")
-    return clicked
+    log_warn(f"[{tag}] [{name}] [第{round_num}轮] 未找到匹配选项，关键词=「{keyword}」")
+    return False
+
+
+def solve_image_challenge(page, dialog, tag: str, name: str, idx: int, identifier: str) -> bool:
+    """
+    处理二级图块挑战（div.auth-captcha-challenge），支持选错后重试：
+      - 最多重试 MAX_ROUNDS 轮
+      - 每轮选完后检测是否出现 "Wrong choice" 提示，若有则等新图块刷新后重试
+    返回 True 表示至少点击过一次（无论最终对错），False 表示无二级挑战。
+    """
+    MAX_ROUNDS = 4
+
+    challenge = dialog.locator("div.auth-captcha-challenge").first
+    try:
+        challenge.wait_for(state="visible", timeout=5000)
+    except Exception:
+        return False  # 没有二级挑战
+
+    screenshot(page, f"acct{idx}_{identifier}_challenge")
+
+    clicked_any = False
+    for round_num in range(1, MAX_ROUNDS + 1):
+        clicked = _do_one_image_challenge_round(
+            page, dialog, challenge, tag, name, idx, identifier, round_num)
+        if clicked:
+            clicked_any = True
+
+        # 等待结果：成功（挑战消失）或失败（"Wrong choice" 提示）
+        wrong = False
+        for _ in range(8):
+            time.sleep(1)
+            # 检测挑战是否已消失（选对了）
+            try:
+                challenge.wait_for(state="hidden", timeout=500)
+                log(f"[{tag}] [{name}] 图块挑战通过 ✅")
+                return True
+            except Exception:
+                pass
+            # 检测 "Wrong choice" 提示
+            try:
+                wrong_el = challenge.locator(
+                    "div.auth-captcha-error, [class*='wrong'], [class*='error']"
+                ).first
+                wrong_el.wait_for(state="visible", timeout=500)
+                wrong_text = wrong_el.inner_text(timeout=500).strip()
+                if wrong_text:
+                    log_warn(f"[{tag}] [{name}] [第{round_num}轮] 选错了: 「{wrong_text}」，等待新图块...")
+                    wrong = True
+                    break
+            except Exception:
+                pass
+
+        if wrong and round_num < MAX_ROUNDS:
+            # 等新图块加载（src 会变）
+            time.sleep(2)
+            screenshot(page, f"acct{idx}_{identifier}_r{round_num}_wrong")
+            continue
+        elif not clicked:
+            break  # 没点到任何选项，不再重试
+
+    return clicked_any
 
 
 # ── 点击按钮 + 走 captcha 弹窗（续期和激活共用）────────────────
@@ -552,11 +614,22 @@ def renew_via_ui(page, tag: str, name: str, identifier: str, idx: int):
             page, tag, name, identifier, idx,
             btn_locator=reactivate_btn,
             action_label="激活",
-            # 实际 API 路径未知，用宽泛片段匹配；也可能是 reactivate/activate
             api_url_fragment="/upgrade/",
             result_holder=react_holder,
             screenshot_prefix=f"acct{idx}_reactivate_{identifier}",
         )
+
+        # 检查激活响应是否已包含新过期时间（was_reactivated=true + expires_at）
+        try:
+            react_data = json.loads(react_holder.get("body") or "")
+            if react_data.get("was_reactivated") or react_data.get("expires_at"):
+                new_remaining = parse_expires(react_data.get("expires_at"))
+                if new_remaining and new_remaining > remaining + 0.05:
+                    log(f"[{tag}] [{name}] 激活已包含续期 ✅ "
+                        f"{remaining:.2f}天 → {new_remaining:.2f}天，跳过单独续期步骤")
+                    return new_remaining
+        except Exception:
+            pass
 
         # 等待卡片刷新为非 suspended 状态（最多 15s）
         log(f"[{tag}] [{name}] 等待激活后状态刷新...")
